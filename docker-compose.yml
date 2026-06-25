@@ -1,0 +1,82 @@
+version: "3.9"
+
+services:
+
+  # ── 1. VulnApp — Deliberately Vulnerable Flask Target ──────────────────────
+  vulnapp:
+    build:
+      context: ./vulnapp
+      dockerfile: Dockerfile
+    container_name: vulnapp
+    ports:
+      - "5000:5000"
+    environment:
+      - FLASK_ENV=development
+      - SECRET_KEY=super_weak_secret_123
+      - JWT_SECRET=weakjwtsecret
+    volumes:
+      - vulnapp_db:/app/data
+    networks:
+      - vulnscan_net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── 2. Scanner API — Python Backend (serves Dashboard + runs scans) ─────────
+  scanner:
+    build:
+      context: ./scanner
+      dockerfile: Dockerfile
+    container_name: vulnscan_api
+    ports:
+      - "8000:8000"
+    environment:
+      - TARGET_URL=http://vulnapp:5000
+      - REPORT_DIR=/app/reports
+    volumes:
+      - ./reports:/app/reports
+    depends_on:
+      vulnapp:
+        condition: service_healthy
+    networks:
+      - vulnscan_net
+    restart: unless-stopped
+
+  # ── 3. Dashboard — React Frontend (served via Nginx) ───────────────────────
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+    container_name: vulnscan_dashboard
+    ports:
+      - "3000:80"
+    depends_on:
+      - scanner
+    networks:
+      - vulnscan_net
+    restart: unless-stopped
+
+  # ── 4. Crypto Demo — Standalone Python module ──────────────────────────────
+  crypto_demo:
+    build:
+      context: ./crypto-demo
+      dockerfile: Dockerfile
+    container_name: vulnscan_crypto
+    ports:
+      - "8080:8080"
+    networks:
+      - vulnscan_net
+    restart: unless-stopped
+
+# ── Volumes ───────────────────────────────────────────────────────────────────
+volumes:
+  vulnapp_db:
+    driver: local
+
+# ── Networks ──────────────────────────────────────────────────────────────────
+networks:
+  vulnscan_net:
+    driver: bridge
