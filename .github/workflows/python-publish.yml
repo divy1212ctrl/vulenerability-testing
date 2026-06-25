@@ -1,0 +1,271 @@
+"""
+VulnScan Pro — API Server
+===========================
+Flask REST API that serves scan results to the React dashboard.
+Runs on port 8000.  The React dashboard (port 3000) talks to this.
+
+Endpoints:
+  GET  /api/results          — latest scan results (from results.json)
+  GET  /api/results/history  — list of past scan files
+  POST /api/scan             — trigger a new scan (async, streamed progress)
+  GET  /api/health           — server health check
+
+Usage:
+  python api_server.py                      # standalone
+  python main.py --target ... --serve       # auto-started after scan
+"""
+
+import json
+import os
+import glob
+import subprocess
+import sys
+import datetime
+from flask import Flask, jsonify, request, Response, stream_with_context
+from flask_cors import CORS                  # pip install flask-cors
+
+
+def create_app(results_dir: str = "reports") -> Flask:
+    app = Flask(__name__)
+    CORS(app, origins=["http://localhost:3000", "http://127.0.0.1:3000"])
+
+    RESULTS_DIR = os.path.abspath(results_dir)
+    RESULTS_JSON = os.path.join(RESULTS_DIR, "results.json")
+
+    # ──────────────────────────────────────────────
+    # Helpers
+    # ──────────────────────────────────────────────
+
+    def _load_results(path: str) -> dict:
+        """Load a results.json file safely."""
+        if not os.path.exists(path):
+            return {"error": "No results file found. Run a scan first.", "findings": []}
+        try:
+            with open(path, encoding="utf-8") as fp:
+                return json.load(fp)
+        except json.JSONDecodeError as e:
+            return {"error": f"Malformed results file: {e}", "findings": []}
+
+    def _severity_summary(findings: list) -> dict:
+        counts = {"Critical": 0, "High": 0, "Medium": 0, "Low": 0, "Info": 0}
+        for f in findings:
+            sev = f.get("severity", "Info")
+            counts[sev] = counts.get(sev, 0) + 1
+        return counts
+
+    # ──────────────────────────────────────────────
+    # Routes
+    # ──────────────────────────────────────────────
+
+    @app.route("/api/health")
+    def health():
+        return jsonify({
+            "status":      "ok",
+            "service":     "VulnScan Pro API",
+            "version":     "1.0.0",
+            "results_dir": RESULTS_DIR,
+            "has_results": os.path.exists(RESULTS_JSON),
+            "timestamp":   datetime.datetime.now().isoformat(),
+        })
+
+    @app.route("/api/results")
+    def get_results():
+        """Return latest scan results with computed summary."""
+        data = _load_results(RESULTS_JSON)
+        if "findings" in data:
+            data["summary"] = _severity_summary(data["findings"])
+            # Group findings by type for chart data
+            type_counts: dict = {}
+            for f in data["findings"]:
+                t = f.get("type", "Unknown")
+                type_counts[t] = type_counts.get(t, 0) + 1
+            data["by_type"] = [
+                {"name": k, "count": v} for k, v in
+                sorted(type_counts.items(), key=lambda x: -x[1])
+            ]
+        return jsonify(data)
+
+    @app.route("/api/results/history")
+    def get_history():
+        """List all past scan result files."""
+        pattern = os.path.join(RESULTS_DIR, "*.json")
+        files = sorted(glob.glob(pattern), key=os.path.getmtime, reverse=True)
+        history = []
+        for fpath in files:
+            try:
+                stat = os.stat(fpath)
+                with open(fpath, encoding="utf-8") as fp:
+                    d = json.load(fp)
+                history.append({
+                    "filename":  os.path.basename(fpath),
+                    "target":    d.get("target", "unknown"),
+                    "timestamp": d.get("timestamp", ""),
+                    "total":     d.get("total", 0),
+                    "size_kb":   round(stat.st_size / 1024, 1),
+                })
+            except Exception:
+                continue
+        return jsonify({"history": history, "count": len(history)})
+
+    @app.route("/api/scan", methods=["POST"])
+    def trigger_scan():
+        """
+        Trigger a new scan.  Body: {"target": "http://...", "format": "html"}
+        Streams back newline-delimited JSON progress events.
+        """
+        body   = request.get_json(silent=True) or {}
+        target = body.get("target", "").strip()
+        fmt    = body.get("format", "html")
+
+        if not target:
+            return jsonify({"error": "target is required"}), 400
+        if not target.startswith(("http://", "https://")):
+            return jsonify({"error": "target must start with http:// or https://"}), 400
+        if fmt not in ("html", "pdf", "both"):
+            fmt = "html"
+
+        def generate():
+            """Stream progress as newline-delimited JSON."""
+            scanner_path = os.path.join(os.path.dirname(__file__), "main.py")
+            cmd = [
+                sys.executable, scanner_path,
+                "--target", target,
+                "--format", fmt,
+                "--out", RESULTS_DIR,
+            ]
+
+            yield json.dumps({"event": "start", "target": target,
+                              "timestamp": datetime.datetime.now().isoformat()}) + "\n"
+
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                )
+                for line in proc.stdout:
+                    line = line.rstrip()
+                    if line:
+                        # Strip ANSI colour codes before sending to dashboard
+                        import re
+                        clean = re.sub(r"\033\[[0-9;]*m", "", line)
+                        yield json.dumps({"event": "log", "line": clean}) + "\n"
+
+                proc.wait()
+                status = "done" if proc.returncode == 0 else "error"
+                yield json.dumps({"event": status,
+                                  "returncode": proc.returncode,
+                                  "timestamp": datetime.datetime.now().isoformat()}) + "\n"
+            except Exception as exc:
+                yield json.dumps({"event": "error", "message": str(exc)}) + "\n"
+
+        return Response(
+            stream_with_context(generate()),
+            mimetype="application/x-ndjson",
+            headers={"X-Accel-Buffering": "no"},   # disable nginx buffering
+        )
+
+    @app.route("/api/findings/export")
+    def export_findings():
+        """Return findings as a downloadable JSON file."""
+        data = _load_results(RESULTS_JSON)
+        resp = jsonify(data)
+        resp.headers["Content-Disposition"] = "attachment; filename=vulnscan-results.json"
+        return resp
+
+    # 404 handler
+    @app.errorhandler(404)
+    def not_found(e):
+        return jsonify({"error": "Endpoint not found"}), 404
+
+    return app
+
+
+# ──────────────────────────────────────────────
+# Standalone entry
+# ──────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import argparse
+    p = argparse.ArgumentParser(description="VulnScan Pro API Server")
+    p.add_argument("--results-dir", default="reports",
+                   help="Directory containing results.json (default: reports/)")
+    p.add_argument("--port", type=int, default=8000)
+    args = p.parse_args()
+
+    flask_app = create_app(results_dir=args.results_dir)
+    print(f"[*] VulnScan Pro API Server starting on http://0.0.0.0:{args.port}")
+    print(f"[*] Serving results from: {os.path.abspath(args.results_dir)}")
+    print(f"[*] Dashboard: http://localhost:3000\n")
+    flask_app.run(host="0.0.0.0", port=args.port, debug=False)# This workflow will upload a Python Package to PyPI when a release is created
+# For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-python#publishing-to-package-registries
+
+# This workflow uses actions that are not certified by GitHub.
+# They are provided by a third-party and are governed by
+# separate terms of service, privacy policy, and support
+# documentation.
+
+name: Upload Python Package
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  release-build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Build release distributions
+        run: |
+          # NOTE: put your own distribution build steps here.
+          python -m pip install build
+          python -m build
+
+      - name: Upload distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-dists
+          path: dist/
+
+  pypi-publish:
+    runs-on: ubuntu-latest
+    needs:
+      - release-build
+    permissions:
+      # IMPORTANT: this permission is mandatory for trusted publishing
+      id-token: write
+
+    # Dedicated environments with protections for publishing are strongly recommended.
+    # For more information, see: https://docs.github.com/en/actions/deployment/targeting-different-environments/using-environments-for-deployment#deployment-protection-rules
+    environment:
+      name: pypi
+      # OPTIONAL: uncomment and update to include your PyPI project URL in the deployment status:
+      # url: https://pypi.org/p/YOURPROJECT
+      #
+      # ALTERNATIVE: if your GitHub Release name is the PyPI project version string
+      # ALTERNATIVE: exactly, uncomment the following line instead:
+      # url: https://pypi.org/project/YOURPROJECT/${{ github.event.release.name }}
+
+    steps:
+      - name: Retrieve release distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: release-dists
+          path: dist/
+
+      - name: Publish release distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
