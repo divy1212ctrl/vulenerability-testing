@@ -328,7 +328,7 @@ Unauthorized use is illegal under the Information Technology Act, 2000 (India) a
 
 ## Author
 
-**Divya Prakash Bharti**
+**Divy**
 
 
 
