@@ -14,7 +14,7 @@
 > ⚠️ **For educational and authorized security testing only.**  
 > Never run VulnApp on a public or production server.
 
-**Built by [Divya Prakash Bharti](https://github.com/divy1212ctrl)**
+**Built by Divy(https://github.com/divy1212ctrl)**
 
 </div>
 
